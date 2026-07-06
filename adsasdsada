@@ -1,22 +1,91 @@
-getgenv().WisHUBCarrotConfig = {
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local VirtualUser = game:GetService("VirtualUser")
+local TeleportService = game:GetService("TeleportService")
+
+local TAG = "[WisHUB Carrot Delta]"
+
+local function bootLog(...)
+	print(TAG, ...)
+end
+
+local function bootWarn(...)
+	warn(TAG, ...)
+end
+
+local function waitForPath(root, path, timeout)
+	local current = root
+	local deadline = os.clock() + (timeout or 60)
+
+	for _, childName in ipairs(path) do
+		while current and not current:FindFirstChild(childName) and os.clock() < deadline do
+			task.wait(0.25)
+		end
+
+		current = current and current:FindFirstChild(childName)
+		if not current then
+			return nil, table.concat(path, ".")
+		end
+	end
+
+	return current
+end
+
+bootLog("script start")
+
+if not game:IsLoaded() then
+	bootLog("waiting game loaded")
+	game.Loaded:Wait()
+end
+
+local player = Players.LocalPlayer
+local remote = waitForPath(ReplicatedStorage, { "SharedModules", "Packet", "RemoteEvent" }, 60)
+if not remote then
+	bootWarn("RemoteEvent belum ready. Execute ulang setelah loading/spawn selesai.")
+	return
+end
+
+if type(buffer) ~= "table" then
+	bootWarn("buffer API tidak tersedia. Fitur packet seperti plant/harvest/sell kemungkinan gagal di Delta build ini.")
+end
+
+--[[
+	TUTORIAL CONFIG NO UI
+	1. Edit table Config di bawah ini.
+	2. Pakai true / false huruf kecil, bukan True / False.
+	3. PlantSeed bisa "Carrot" atau "Mega".
+	4. HarvestBelowKg:
+	   - 0 = harvest semua fruit.
+	   - 2.5 = harvest fruit di bawah 2.5kg, fruit >= 2.5kg disimpan.
+	5. Speed:
+	   - 0.1 = paling cepat, lebih berat.
+	   - 1 = paling santai, lebih ringan.
+	6. Sprinkler:
+	   - AutoSprinkler = true akan taruh sprinkler yang true di table Sprinklers.
+	   - AutoSprinkler = false tidak taruh sprinkler baru, tapi tetap plant di sekitar sprinkler yang sudah ada.
+	7. HidePlantsExceptCarrot = true menyembunyikan visual plant selain carrot, tapi ProximityPrompt tidak disentuh.
+	8. Rollback = true nyalain rollback sebelum plant/harvest.
+	9. AutoRejoin = true rejoin kalau belum ada carrot sesuai kg dan seed habis.
+]]
+
+local DEFAULT_CONFIG = {
 	AutoPlant = true,
-	PlantSeed = "Mega",
-
+	PlantSeed = "Mega", -- "Carrot" / "Mega"
 	AutoHarvest = true,
-	HarvestBelowKg = 100,
-
-	AutoSell = true,
+	HarvestBelowKg = 50,
+	AutoSell = false,
 	AutoSprinkler = true,
 	HidePlantsExceptCarrot = true,
-	Rollback = getgenv().WisHUBCarrotDisableRollbackNextRun ~= true,
+	Rollback = true,
 	AutoRejoin = true,
 	RejoinSeed = "Auto",
 	RejoinCheckInterval = 3,
 	RejoinDelay = 8,
-	RelogIfLoadingStuck = true,
-	LoadingStuckDelay = 35,
-	LoadingStuckRelogDelay = 2,
-	Speed = 0.01,
+	WaitForInventoryBeforeRejoin = true,
+	InventoryEmptyConfirmDelay = 12,
+	Speed = 0.2,
 
 	Sprinklers = {
 		["Super Sprinkler"] = true,
@@ -25,28 +94,15 @@ getgenv().WisHUBCarrotConfig = {
 		["Rare Sprinkler"] = false,
 		["Legendary Sprinkler"] = false,
 	},
+
+	-- Bisa juga pakai top-level begini kalau mau simpel:
+	-- ["Super Sprinkler"] = true,
+	-- ["Common Sprinkler"] = false,
 }
 
-getgenv().WisHUBCarrotDisableRollbackNextRun = false
-
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TeleportService = game:GetService("TeleportService")
-
-local player = Players.LocalPlayer
-local remote = ReplicatedStorage.SharedModules.Packet.RemoteEvent
-
-local Env = (type(getgenv) == "function" and getgenv()) or _G
-Env.WisHUBCarrotRunId = (tonumber(Env.WisHUBCarrotRunId) or 0) + 1
-local RUN_ID = Env.WisHUBCarrotRunId
-
-local Config = Env.WisHUBCarrotConfig
+local Config = (type(getgenv) == "function" and getgenv().WisHUBCarrotConfig)
 	or rawget(_G, "WisHUBCarrotConfig")
-	or {}
-
-local function isCurrentRun()
-	return Env.WisHUBCarrotRunId == RUN_ID
-end
+	or DEFAULT_CONFIG
 
 local CONFIG_SPRINKLER_NAMES = {
 	"Common Sprinkler",
@@ -98,8 +154,8 @@ local function cfgString(key, default)
 end
 
 local function cfgSelectedSprinklers()
-	if not cfgBool("AutoSprinkler", false) then
-		return {}
+	if not cfgBool("AutoSprinkler", true) then
+		return { "All" }
 	end
 
 	local selected = {}
@@ -120,40 +176,97 @@ local function cfgSelectedSprinklers()
 	return selected
 end
 
-local state = {
-	autoHarvestCarrot = cfgBool("AutoHarvest", false),
-	autoPlantCarrot = cfgBool("AutoPlant", false),
-	autoSellAll = cfgBool("AutoSell", false),
-	hideNonCarrotVisuals = cfgBool("HidePlantsExceptCarrot", cfgBool("HideNonCarrotVisuals", false)),
-	harvestKg = cfgNumber("HarvestBelowKg", 0, 0),
-	farmSpeed = cfgNumber("Speed", 0.2, 0.1, 1),
-	selectedPlantSeed = cfgString("PlantSeed", "Carrot"),
-	selectedSprinklers = cfgSelectedSprinklers(),
-	hideNonCarrotConnections = {},
-	hiddenNonCarrotVisuals = {},
-}
-
-local function tracebackMessage(message)
-	if type(debug) == "table" and type(debug.traceback) == "function" then
-		return debug.traceback(message, 2)
-	end
-	return message
+function customKick(message, code, button)
+    game.Players.LocalPlayer:Kick()
+    task.wait()
+    local text = table.concat({
+        message,
+        "",
+        "Error Code: " .. code
+    }, "\n")
+    local kickPrompt = game.CoreGui.RobloxPromptGui.promptOverlay.ErrorPrompt
+    kickPrompt.TitleFrame.ErrorTitle.Text = "Wisnu Cuki"
+    kickPrompt.MessageArea.ErrorFrame.ErrorMessage.RichText = true
+    kickPrompt.MessageArea.ErrorFrame.ErrorMessage.Text = text
+    kickPrompt.MessageArea.ErrorFrame.ButtonArea.LeaveButton.ButtonText.Text = button or "OK"
 end
 
-local function safeSpawn(label, fn)
+local state = {
+	autoHarvestCarrot = cfgBool("AutoHarvest", true),
+	autoPlantCarrot = cfgBool("AutoPlant", true),
+	autoBuyCarrotSeed = false,
+	autoMailbox = false,
+	autoSellAll = cfgBool("AutoSell", false),
+	autoClaimMail = false,
+	autoCollectSeed = false,
+	boostFps = false,
+	hideNonCarrotVisuals = cfgBool("HidePlantsExceptCarrot", cfgBool("HideNonCarrotVisuals", true)),
+	noclip = false,
+	harvestKg = cfgNumber("HarvestBelowKg", 0, 0),
+	autoKickAtDesiredKg = false,
+	farmSpeed = cfgNumber("Speed", 0.2, 0.1, 1),
+	mailTargetUsername = "",
+	mailNote = "Gift from WisHUB",
+	mailTargetValue = 100000,
+	selectedPlantSeed = cfgString("PlantSeed", "Carrot"),
+	selectedSprinklers = cfgSelectedSprinklers(),
+	boostFpsConnection = nil,
+	boostFpsLighting = nil,
+	hideNonCarrotConnections = {},
+	hiddenNonCarrotVisuals = {},
+	noclipConnection = nil,
+	noclipConnections = {},
+	noclipDescendantConnection = nil,
+	noclipParts = {},
+}
+
+
+local function startAntiAfkIdleOverride()
+	local token = {}
+	_G.WisHubCarrotAntiAfkToken = token
+
+	pcall(function()
+		player:SetAttribute("AntiAfkIdleOverride", 1000000000)
+	end)
+
 	task.spawn(function()
-		local ok, err = xpcall(fn, tracebackMessage)
-		if not ok then
-			warn("[WisHUB Carrot " .. tostring(label) .. "] " .. tostring(err))
+		while _G.WisHubCarrotAntiAfkToken == token do
+			pcall(function()
+				local value = tonumber(player:GetAttribute("AntiAfkIdleOverride")) or 0
+				if value < 1000000000 then
+					player:SetAttribute("AntiAfkIdleOverride", 1000000000)
+				end
+			end)
+			task.wait(5)
 		end
 	end)
 end
 
+local function startAntiAfkVirtualUser()
+	if _G.WisHubCarrotAntiAfkConnection then
+		pcall(function()
+			_G.WisHubCarrotAntiAfkConnection:Disconnect()
+		end)
+	end
+
+	_G.WisHubCarrotAntiAfkConnection = player.Idled:Connect(function()
+		pcall(function()
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton2(Vector2.new())
+		end)
+	end)
+end
+
+local function startAntiAfk()
+	startAntiAfkIdleOverride()
+	startAntiAfkVirtualUser()
+end
 
 local packetCache = {}
 local packetNames = {
 	collectfruit = { "CollectFruit" },
 	plantseed = { "PlantSeed" },
+	purchaseseed = { "PurchaseSeed", "BuySeed" },
 	sellall = { "SellAll", "SellInventory" },
 	placesprinkler = { "PlaceSprinkler" },
 }
@@ -190,43 +303,6 @@ end
 
 local function getCharacter()
 	return player.Character or workspace:FindFirstChild(player.Name)
-end
-
-local function findChildOfClass(parent, className, recursive)
-	if not parent then
-		return nil
-	end
-
-	if type(parent.FindFirstChildOfClass) == "function" then
-		local ok, child = pcall(function()
-			return parent:FindFirstChildOfClass(className)
-		end)
-		if ok and child then
-			return child
-		end
-	end
-
-	if type(parent.FindFirstChildWhichIsA) == "function" then
-		local ok, child = pcall(function()
-			return parent:FindFirstChildWhichIsA(className, recursive == true)
-		end)
-		if ok and child then
-			return child
-		end
-	end
-
-	local ok, children = pcall(function()
-		return recursive and parent:GetDescendants() or parent:GetChildren()
-	end)
-	if not ok or not children then
-		return nil
-	end
-
-	for _, child in ipairs(children) do
-		if child and child.IsA and child:IsA(className) then
-			return child
-		end
-	end
 end
 
 local function getMyPlot()
@@ -338,46 +414,6 @@ local function readNumber(obj, attrs, includeAncestor)
 	end
 end
 
-local function parseKgText(text)
-	text = tostring(text or "")
-	local number = text:match("([%d]+%.?%d*)%s*[kK][gG]") or text:match("([%d]+%,?%d*)%s*[kK][gG]")
-	if number then
-		return tonumber((number:gsub(",", ".")))
-	end
-end
-
-local function readDisplayedKg(obj)
-	if not obj then
-		return nil
-	end
-
-	local value = parseKgText(obj.Name)
-	if value then
-		return value
-	end
-
-	if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
-		value = parseKgText(obj.Text)
-		if value then
-			return value
-		end
-	end
-
-	local checked = 0
-	for _, child in ipairs(obj:GetDescendants()) do
-		if child:IsA("TextLabel") or child:IsA("TextButton") or child:IsA("TextBox") then
-			value = parseKgText(child.Text)
-			if value then
-				return value
-			end
-		end
-		checked += 1
-		if checked >= 100 then
-			break
-		end
-	end
-end
-
 local carrotBaseWeight
 local function getCarrotBaseWeight()
 	if carrotBaseWeight ~= nil then
@@ -431,11 +467,6 @@ local CARROT_WEIGHT_MULTIPLIER = 0.534
 local function getObjectKg(obj)
 	if not obj then
 		return 0
-	end
-
-	local displayed = readDisplayedKg(obj)
-	if displayed then
-		return displayed
 	end
 
 	-- Try direct weight attributes first
@@ -571,7 +602,7 @@ end
 
 local function equipSeed(seedName)
 	local char = getCharacter()
-	local hum = findChildOfClass(char, "Humanoid")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	local tool, equipped = findSeedTool(seedName)
 
 	if not char or not hum or not tool then
@@ -581,15 +612,7 @@ local function equipSeed(seedName)
 		return tool
 	end
 
-	if type(hum.EquipTool) == "function" then
-		pcall(function()
-			hum:EquipTool(tool)
-		end)
-	else
-		pcall(function()
-			tool.Parent = char
-		end)
-	end
+	hum:EquipTool(tool)
 	task.wait()
 
 	local newTool, isEquipped = findSeedTool(seedName)
@@ -623,6 +646,55 @@ local function turboYield(interval)
 	end
 end
 
+local function fireBuySeed(seedName)
+	local id = getPacketIdByNames(packetNames.purchaseseed)
+	if not id then
+		return false
+	end
+
+	local payload = packetIdToString(id) .. string.char(#seedName) .. seedName
+	remote:FireServer(buffer.fromstring(payload))
+	return true
+end
+
+local function getCarrotSeedStock()
+	local stockValues = ReplicatedStorage:FindFirstChild("StockValues")
+	local seedShop = stockValues and stockValues:FindFirstChild("SeedShop")
+	local items = seedShop and seedShop:FindFirstChild("Items")
+	local carrot = items and items:FindFirstChild("Carrot")
+
+	return tonumber(carrot and carrot.Value) or 0
+end
+
+local function buyCarrotSeedsOnce()
+	local stock = getCarrotSeedStock()
+	if stock <= 0 then
+		return 0
+	end
+
+	local bought = 0
+	for _ = 1, stock do
+		if not state.autoBuyCarrotSeed then
+			break
+		end
+		if fireBuySeed("Carrot") then
+			bought += 1
+			turboYield()
+		end
+	end
+
+	return bought
+end
+
+local function startBuyCarrotSeed()
+	task.spawn(function()
+		while state.autoBuyCarrotSeed do
+			buyCarrotSeedsOnce()
+			task.wait(0.01)
+		end
+	end)
+end
+
 local function fireSellAll()
 	local id = getPacketIdByNames(packetNames.sellall)
 	if not id then
@@ -634,8 +706,8 @@ local function fireSellAll()
 end
 
 local function startSellAll()
-	safeSpawn("sell", function()
-		while isCurrentRun() and state.autoSellAll do
+	task.spawn(function()
+		while state.autoSellAll do
 			fireSellAll()
 			task.wait(0.1)
 		end
@@ -684,10 +756,10 @@ local SPRINKLER_CLUSTER_MATCH_DISTANCE = 5
 local SPRINKLER_ANCHOR_COUNT = 1
 local SPRINKLER_PLACE_RETRY_DELAY = 2.5
 local SPRINKLER_MAINTENANCE_INTERVAL = 1
-local HARVEST_BRUTE_PASSES = 5
-local HARVEST_BRUTE_RETRIES = 3
-local HARVEST_YIELD_INTERVAL = 70
-local HARVEST_MAX_FIRES_PER_CYCLE = 120
+local HARVEST_BRUTE_PASSES = 3
+local HARVEST_BRUTE_RETRIES = 2
+local HARVEST_YIELD_INTERVAL = 24
+local HARVEST_MAX_FIRES_PER_CYCLE = 24
 local PLANT_AREA_RANDOM_FACTOR = 0.49
 local PLANT_ANCHOR_RANDOM_FACTOR = 0.44
 local PLANT_SPRINKLER_ATTEMPTS = 24
@@ -710,6 +782,7 @@ local sprinklerRuntime = {
 	Waiting = {},
 	Placing = false,
 	Anchors = {},
+	PlantTeleported = false,
 	PlantReady = false,
 	LastMaintenance = 0,
 }
@@ -838,7 +911,7 @@ local function getInstancePosition(obj)
 		return root.Position
 	end
 
-	local part = findChildOfClass(obj, "BasePart", true)
+	local part = obj:FindFirstChildWhichIsA("BasePart", true)
 	return part and part.Position or nil
 end
 
@@ -929,6 +1002,14 @@ local function distanceXZ(a, b)
 	return math.sqrt(dx * dx + dz * dz)
 end
 
+local function getRandomPointInArea(area)
+	local sx = area.Size.X * PLANT_ANCHOR_RANDOM_FACTOR
+	local sz = area.Size.Z * PLANT_ANCHOR_RANDOM_FACTOR
+	local x = (math.random() * 2 - 1) * sx
+	local z = (math.random() * 2 - 1) * sz
+	return area.CFrame:PointToWorldSpace(Vector3.new(x, 0, z))
+end
+
 local function getAreaCenterPosition(area)
 	return area.CFrame:PointToWorldSpace(Vector3.new(0, 0, 0))
 end
@@ -944,6 +1025,20 @@ end
 
 local function getSprinklerPlacePosition(anchor, sprinklerIndex)
 	return anchor + getSprinklerOffset(sprinklerIndex)
+end
+
+local function teleportToSprinklerPosition(position)
+	local char = getCharacter()
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root or not position then
+		return false
+	end
+
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	root.CFrame = CFrame.new(position + Vector3.new(0, 3, 0))
+	task.wait(0.08)
+	return true
 end
 
 local function findPlacedSprinklerNear(sprinklerName, position, maxDistance)
@@ -1057,10 +1152,30 @@ local function ensureSprinklerAnchors()
 	return sprinklerRuntime.Anchors
 end
 
+local function teleportToPlotOnce()
+	if sprinklerRuntime.PlantTeleported then
+		return true
+	end
+
+	local anchors = ensureSprinklerAnchors()
+	local target = anchors[1] and anchors[1].Position or getRootPosition()
+	if not target then
+		return false
+	end
+
+	if teleportToSprinklerPosition(target) then
+		sprinklerRuntime.PlantTeleported = true
+		return true
+	end
+
+	return false
+end
+
 local function resetPlantSetup()
 	sprinklerRuntime.Seen = {}
 	sprinklerRuntime.Waiting = {}
 	sprinklerRuntime.Placing = false
+	sprinklerRuntime.PlantTeleported = false
 	sprinklerRuntime.PlantReady = false
 	sprinklerRuntime.LastMaintenance = 0
 
@@ -1094,7 +1209,7 @@ end
 
 local function equipTool(tool)
 	local char = getCharacter()
-	local hum = findChildOfClass(char, "Humanoid")
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	if not char or not hum or not tool then
 		return false
 	end
@@ -1102,15 +1217,7 @@ local function equipTool(tool)
 		return true
 	end
 
-	if type(hum.EquipTool) == "function" then
-		pcall(function()
-			hum:EquipTool(tool)
-		end)
-	else
-		pcall(function()
-			tool.Parent = char
-		end)
-	end
+	hum:EquipTool(tool)
 	task.wait()
 	return tool.Parent == char
 end
@@ -1168,7 +1275,7 @@ local function getPlantableSprinklers()
 end
 
 local function placeMissingSprinklersOnce()
-	if not cfgBool("AutoSprinkler", false) then
+	if not cfgBool("AutoSprinkler", true) then
 		return #getPlacedSprinklers()
 	end
 	if sprinklerRuntime.Placing then
@@ -1212,7 +1319,7 @@ local function placeMissingSprinklersOnce()
 end
 
 local function countMissingAvailableSprinklers()
-	if not cfgBool("AutoSprinkler", false) then
+	if not cfgBool("AutoSprinkler", true) then
 		return 0
 	end
 	local missing = 0
@@ -1259,8 +1366,8 @@ local function harvestCarrotsOnce()
 	local farmPower = 1.1 - farmSpeed
 	local harvestPasses = math.max(1, math.floor(HARVEST_BRUTE_PASSES * farmPower + 0.5))
 	local harvestRetries = math.max(1, math.floor(HARVEST_BRUTE_RETRIES * farmPower + 0.5))
-	local yieldInterval = math.max(25, math.floor(HARVEST_YIELD_INTERVAL * farmPower + 0.5))
-	local maxFires = math.max(12, math.floor(HARVEST_MAX_FIRES_PER_CYCLE * farmPower + 0.5))
+	local yieldInterval = math.max(20, math.floor(HARVEST_YIELD_INTERVAL * farmPower + 0.5))
+	local maxFires = math.max(4, math.floor(HARVEST_MAX_FIRES_PER_CYCLE * farmPower + 0.5))
 	local plantChildren = plants:GetChildren()
 
 	for _ = 1, harvestPasses do
@@ -1285,6 +1392,11 @@ local function harvestCarrotsOnce()
 						local fruitId = getFruitId(fruit)
 						local kg = getObjectKg(fruit)
 
+						if state.autoKickAtDesiredKg and harvestKg > 0 and kg > harvestKg then
+							customKick("Udah dapet " .. tostring(getObjectName(fruit) or "fruit") .. " " .. string.format("%.2f", kg) .. "kg woi", 67, "Lanjut Kompe")
+							return fired
+						end
+
 						local skipKg = harvestKg > 0 and kg > 0 and kg >= harvestKg
 						if fruitId and not skipKg then
 							for _ = 1, harvestRetries do
@@ -1300,6 +1412,11 @@ local function harvestCarrotsOnce()
 					end
 				else
 					local kg = getObjectKg(plant)
+
+					if state.autoKickAtDesiredKg and harvestKg > 0 and kg > harvestKg then
+						customKick("Udah dapet " .. tostring(getObjectName(plant) or "fruit") .. " " .. string.format("%.2f", kg) .. "kg", 67, "Lanjut Kompe")
+						return fired
+					end
 
 					local skipKg = harvestKg > 0 and kg > 0 and kg >= harvestKg
 					if plantId and not skipKg then
@@ -1322,13 +1439,37 @@ local function harvestCarrotsOnce()
 end
 
 local function startHarvestCarrot()
-	safeSpawn("harvest", function()
-		while isCurrentRun() and state.autoHarvestCarrot do
+	task.spawn(function()
+		while state.autoHarvestCarrot do
 			harvestCarrotsOnce()
 			local farmSpeed = math.max(0.1, math.min(1, tonumber(state.farmSpeed) or 0.1))
-			task.wait(math.max(0.008, farmSpeed * 0.055))
+			task.wait(math.max(0.03, farmSpeed * 0.12))
 		end
 	end)
+end
+
+local function getPlayerPlantPosition()
+	local char = getCharacter()
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	return root and root.Position or nil
+end
+
+local function getRandomAreaPosition(area)
+	local sx = area.Size.X * PLANT_AREA_RANDOM_FACTOR
+	local sz = area.Size.Z * PLANT_AREA_RANDOM_FACTOR
+	local x = (math.random() * 2 - 1) * sx
+	local z = (math.random() * 2 - 1) * sz
+	return area.CFrame:PointToWorldSpace(Vector3.new(x, 0, z))
+end
+
+local function getRandomPlotPosition()
+	local areas = getPlantAreas()
+	if #areas == 0 then
+		return getPlayerPlantPosition()
+	end
+
+	local area = areas[math.random(1, #areas)]
+	return getRandomAreaPosition(area)
 end
 
 local function getPlantSpacing(seedName)
@@ -1521,11 +1662,314 @@ local function plantCarrotsOnce()
 end
 
 local function startPlantCarrot()
-	safeSpawn("plant", function()
-		while isCurrentRun() and state.autoPlantCarrot do
+	task.spawn(function()
+		while state.autoPlantCarrot do
 			plantCarrotsOnce()
 			local farmSpeed = math.max(0.1, math.min(1, tonumber(state.farmSpeed) or 0.1))
 			task.wait(math.max(0.03, farmSpeed * 0.12))
+		end
+	end)
+end
+
+local function clearNoclipConnections()
+	if state.noclipConnection then
+		state.noclipConnection:Disconnect()
+		state.noclipConnection = nil
+	end
+
+	for _, connection in ipairs(state.noclipConnections or {}) do
+		if connection then
+			connection:Disconnect()
+		end
+	end
+	state.noclipConnections = {}
+	state.noclipParts = {}
+
+	if state.noclipDescendantConnection then
+		state.noclipDescendantConnection:Disconnect()
+		state.noclipDescendantConnection = nil
+	end
+end
+
+local function isGardenPlantOrFruitPart(obj)
+	if not obj or not obj:IsA("BasePart") then
+		return false
+	end
+
+	local gardens = workspace:FindFirstChild("Gardens")
+	if not gardens then
+		return false
+	end
+
+	local current = obj.Parent
+	local underPlantOrFruit = false
+	while current do
+		if current == gardens then
+			return underPlantOrFruit
+		end
+		if current.Name == "Plants" or current.Name == "Fruits" then
+			underPlantOrFruit = true
+		end
+		current = current.Parent
+	end
+
+	return false
+end
+
+local function disableNoclipPart(obj)
+	if obj and obj:IsA("BasePart") then
+		obj.CanCollide = false
+	end
+end
+
+local function addNoclipPart(obj)
+	if obj and obj:IsA("BasePart") then
+		state.noclipParts[obj] = true
+		disableNoclipPart(obj)
+	end
+end
+
+local function applyCharacterNoclip(char)
+	if char then
+		for _, obj in ipairs(char:GetDescendants()) do
+			if obj:IsA("BasePart") then
+				disableNoclipPart(obj)
+			end
+		end
+	end
+end
+
+local function scanInitialGardenNoclipParts()
+	local gardens = workspace:FindFirstChild("Gardens")
+	if not gardens then
+		return
+	end
+
+	for _, obj in ipairs(gardens:GetDescendants()) do
+		if isGardenPlantOrFruitPart(obj) then
+			addNoclipPart(obj)
+		end
+	end
+end
+
+local function applyNoclipToNewObject(obj)
+	if isGardenPlantOrFruitPart(obj) then
+		addNoclipPart(obj)
+	elseif obj:IsA("BasePart") then
+		local char = getCharacter()
+		if char and obj:IsDescendantOf(char) then
+			disableNoclipPart(obj)
+		end
+	end
+end
+
+local function refreshCachedNoclipParts()
+	local cleaned = 0
+	for part in pairs(state.noclipParts) do
+		if part.Parent then
+			disableNoclipPart(part)
+		else
+			state.noclipParts[part] = nil
+		end
+
+		cleaned += 1
+		if cleaned % 250 == 0 then
+			task.wait()
+		end
+	end
+
+	applyCharacterNoclip(getCharacter())
+end
+
+local function connectCharacterNoclip(char)
+	if not char then
+		return
+	end
+
+	applyCharacterNoclip(char)
+	table.insert(state.noclipConnections, char.DescendantAdded:Connect(function(obj)
+		if state.noclip and obj:IsA("BasePart") then
+			disableNoclipPart(obj)
+		end
+	end))
+end
+
+local function setNoclip(enabled)
+	state.noclip = enabled == true
+	clearNoclipConnections()
+
+	if not state.noclip then
+		return
+	end
+
+	connectCharacterNoclip(getCharacter())
+	scanInitialGardenNoclipParts()
+
+	state.noclipDescendantConnection = workspace.DescendantAdded:Connect(function(obj)
+		if state.noclip then
+			applyNoclipToNewObject(obj)
+		end
+	end)
+	table.insert(state.noclipConnections, player.CharacterAdded:Connect(function(char)
+		if not state.noclip then
+			return
+		end
+
+		connectCharacterNoclip(char)
+	end))
+
+	task.spawn(function()
+		while state.noclip do
+			refreshCachedNoclipParts()
+			task.wait(1)
+		end
+	end)
+end
+
+local function clearBoostFpsConnection()
+	if state.boostFpsConnection then
+		state.boostFpsConnection:Disconnect()
+		state.boostFpsConnection = nil
+	end
+end
+
+local function saveBoostFpsLighting()
+	if state.boostFpsLighting then
+		return
+	end
+
+	state.boostFpsLighting = {
+		Brightness = Lighting.Brightness,
+		GlobalShadows = Lighting.GlobalShadows,
+		EnvironmentDiffuseScale = Lighting.EnvironmentDiffuseScale,
+		EnvironmentSpecularScale = Lighting.EnvironmentSpecularScale,
+		FogEnd = Lighting.FogEnd,
+		FogStart = Lighting.FogStart,
+		OutdoorAmbient = Lighting.OutdoorAmbient,
+		ClockTime = Lighting.ClockTime,
+	}
+end
+
+local function restoreBoostFpsLighting()
+	local saved = state.boostFpsLighting
+	if not saved then
+		return
+	end
+
+	for property, value in pairs(saved) do
+		pcall(function()
+			Lighting[property] = value
+		end)
+	end
+end
+
+local function applyBoostFpsLighting()
+	saveBoostFpsLighting()
+
+	pcall(function()
+		settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+	end)
+	pcall(function()
+		Lighting.Brightness = 0
+		Lighting.GlobalShadows = false
+		Lighting.EnvironmentDiffuseScale = 0
+		Lighting.EnvironmentSpecularScale = 0
+		Lighting.FogStart = 0
+		Lighting.FogEnd = 9e9
+		Lighting.OutdoorAmbient = Color3.new(0, 0, 0)
+		Lighting.ClockTime = 0
+	end)
+
+	for _, obj in ipairs(Lighting:GetDescendants()) do
+		if obj:IsA("PostEffect") then
+			pcall(function()
+				obj.Enabled = false
+			end)
+		elseif obj:IsA("Atmosphere") then
+			pcall(function()
+				obj.Density = 0
+				obj.Haze = 0
+				obj.Glare = 0
+			end)
+		end
+	end
+
+	local terrain = workspace:FindFirstChildOfClass("Terrain")
+	if terrain then
+		pcall(function()
+			terrain.Decoration = false
+			terrain.WaterWaveSize = 0
+			terrain.WaterWaveSpeed = 0
+			terrain.WaterReflectance = 0
+			terrain.WaterTransparency = 1
+		end)
+	end
+end
+
+local function applyBoostFpsObject(obj)
+	if obj:IsA("BasePart") then
+		pcall(function()
+			obj.Material = Enum.Material.SmoothPlastic
+			obj.Reflectance = 0
+			obj.CastShadow = false
+		end)
+	elseif obj:IsA("Decal") or obj:IsA("Texture") then
+		pcall(function()
+			obj.Transparency = 1
+		end)
+	elseif obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam") or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles") then
+		pcall(function()
+			obj.Enabled = false
+		end)
+	elseif obj:IsA("PointLight") or obj:IsA("SurfaceLight") or obj:IsA("SpotLight") then
+		pcall(function()
+			obj.Enabled = false
+		end)
+	elseif obj:IsA("Clouds") then
+		pcall(function()
+			obj.Enabled = false
+		end)
+	end
+end
+
+local function applyBoostFps()
+	applyBoostFpsLighting()
+
+	local processed = 0
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if not state.boostFps then
+			return
+		end
+
+		applyBoostFpsObject(obj)
+		processed += 1
+		if processed % 250 == 0 then
+			task.wait()
+		end
+	end
+end
+
+local function setBoostFps(enabled)
+	state.boostFps = enabled == true
+	clearBoostFpsConnection()
+
+	if not state.boostFps then
+		restoreBoostFpsLighting()
+		return
+	end
+
+	applyBoostFpsLighting()
+	state.boostFpsConnection = workspace.DescendantAdded:Connect(function(obj)
+		if state.boostFps then
+			task.defer(applyBoostFpsObject, obj)
+		end
+	end)
+
+	task.spawn(function()
+		applyBoostFps()
+		while state.boostFps do
+			applyBoostFpsLighting()
+			task.wait(5)
 		end
 	end)
 end
@@ -1725,8 +2169,8 @@ do
 		end
 
 		watchNonCarrotPlants()
-		safeSpawn("hide", function()
-			while isCurrentRun() and state.hideNonCarrotVisuals do
+		task.spawn(function()
+			while state.hideNonCarrotVisuals do
 				applyHideNonCarrotVisuals()
 				task.wait(3)
 			end
@@ -1734,10 +2178,488 @@ do
 	end
 end
 
+local networkingCache
+local function getNetworking()
+	if networkingCache ~= nil then
+		return networkingCache or nil
+	end
+
+	local ok, result = pcall(function()
+		return require(ReplicatedStorage.SharedModules.Networking)
+	end)
+	networkingCache = ok and result or false
+	return networkingCache or nil
+end
+
+local playerStateClientCache
+local function getPlayerStateClient()
+	if playerStateClientCache ~= nil then
+		return playerStateClientCache or nil
+	end
+
+	local ok, result = pcall(function()
+		return require(ReplicatedStorage.ClientModules.PlayerStateClient)
+	end)
+	playerStateClientCache = ok and result or false
+	return playerStateClientCache or nil
+end
+
+local fruitValueCalcCache
+local function getFruitValueCalc()
+	if fruitValueCalcCache ~= nil then
+		return fruitValueCalcCache or nil
+	end
+
+	local ok, result = pcall(function()
+		return require(ReplicatedStorage.SharedModules.FruitValueCalc)
+	end)
+	fruitValueCalcCache = ok and result or false
+	return fruitValueCalcCache or nil
+end
+
+local function parseShecklesValue(value)
+	local text = tostring(value or ""):lower():gsub(",", ""):gsub("%s+", "")
+	local number, suffix = text:match("([%d%.]+)([kmbt]?)")
+	local amount = tonumber(number) or 0
+	local multipliers = {
+		k = 1000,
+		m = 1000000,
+		b = 1000000000,
+		t = 1000000000000,
+	}
+
+	return math.max(0, math.floor(amount * (multipliers[suffix] or 1)))
+end
+
+local function getInventory()
+	local playerStateClient = getPlayerStateClient()
+	if not playerStateClient or type(playerStateClient.GetLocalReplica) ~= "function" then
+		return {}
+	end
+
+	local replica = playerStateClient:GetLocalReplica()
+	return replica and replica.Data and replica.Data.Inventory or {}
+end
+
+local function cleanToolName(text)
+	return tostring(text or ""):match("^(.-) %(") or tostring(text or "")
+end
+
+local function getInventoryFruitName(obj)
+	if not obj then
+		return nil
+	end
+
+	for _, attr in ipairs({ "FruitName", "Fruit", "SeedName", "Seed" }) do
+		local value = obj:GetAttribute(attr)
+		if type(value) == "string" and value ~= "" then
+			return value
+		end
+	end
+
+	local cleaned = cleanToolName(obj.Name)
+	if cleaned ~= "" then
+		return cleaned
+	end
+end
+
+local function isInventoryFruitObject(obj)
+	if not obj or not obj:IsA("Tool") then
+		return false
+	end
+
+	local mainCategory = tostring(obj:GetAttribute("MainCategory") or "")
+	if mainCategory == "Seed" or obj:GetAttribute("SeedTool") then
+		return false
+	end
+	if obj:GetAttribute("Pet") or obj:GetAttribute("PetId") then
+		return false
+	end
+
+	if mainCategory == "Fruit" or mainCategory == "HarvestedFruit" or mainCategory == "HarvestedFruits" then
+		return true
+	end
+
+	return obj:GetAttribute("FruitId")
+		or obj:GetAttribute("FruitID")
+		or obj:GetAttribute("FruitUUID")
+		or obj:GetAttribute("FruitName")
+		or obj:GetAttribute("Fruit")
+		or tostring(obj.Name):lower():find("kg", 1, true) ~= nil
+end
+
+local function getBackpackFruitMailData()
+	local data = {}
+	for _, container in ipairs({ getCharacter(), player:FindFirstChild("Backpack") }) do
+		if container then
+			for _, obj in ipairs(container:GetChildren()) do
+				if isInventoryFruitObject(obj) then
+					local key = tostring(obj:GetAttribute("Id") or obj:GetAttribute("FruitId") or obj:GetAttribute("FruitID") or obj:GetAttribute("UUID") or obj.Name)
+					local name = getInventoryFruitName(obj)
+					if key ~= "" and name and name ~= "" then
+						data[key] = {
+							FruitName = name,
+							Name = name,
+							Count = 1,
+							Instance = obj,
+						}
+					end
+				end
+			end
+		end
+	end
+	return data
+end
+
+local function getHarvestedFruitData()
+	local inv = getInventory()
+	local data = inv.HarvestedFruits
+	if type(data) == "table" and next(data) ~= nil then
+		return data
+	end
+	if type(inv.Fruits) == "table" and next(inv.Fruits) ~= nil then
+		return inv.Fruits
+	end
+	if type(inv.Fruit) == "table" and next(inv.Fruit) ~= nil then
+		return inv.Fruit
+	end
+
+	return getBackpackFruitMailData()
+end
+
+local function getFruitValueForMail(key, value)
+	local direct = type(value) == "table" and (value.SellValue or value.Value or value.TotalValue or value.Price)
+	if tonumber(direct) and tonumber(direct) > 0 then
+		return tonumber(direct)
+	end
+
+	local fruitName = type(value) == "table" and (value.FruitName or value.Name) or key
+	if type(fruitName) ~= "string" or fruitName == "" then
+		return 0
+	end
+
+	local fruitValueCalc = getFruitValueCalc()
+	if type(fruitValueCalc) ~= "function" then
+		return 0
+	end
+
+	local instance = type(value) == "table" and value.Instance
+	local sizeMulti = 1
+	local mutation
+	if instance then
+		local kg = getObjectKg(instance)
+		local baseWeight = getFruitBaseWeightByName(fruitName)
+		if kg and baseWeight and baseWeight > 0 then
+			sizeMulti = kg / baseWeight
+		elseif kg and kg > 0 then
+			sizeMulti = kg
+		end
+		mutation = instance:GetAttribute("Mutation") or instance:GetAttribute("FruitMutation")
+	elseif type(value) == "table" then
+		sizeMulti = tonumber(value.SizeMultiplier or value.SizeMulti or value.Multiplier) or 1
+		local weight = tonumber(value.Weight or value.WeightKG or value.KG)
+		local baseWeight = getFruitBaseWeightByName(fruitName)
+		if weight and baseWeight and baseWeight > 0 then
+			sizeMulti = weight / baseWeight
+		elseif weight then
+			sizeMulti = weight
+		end
+		mutation = value.Mutation
+	end
+
+	local ok, result = pcall(fruitValueCalc, fruitName, sizeMulti, mutation, player, nil)
+	return ok and math.max(0, tonumber(result) or 0) or 0
+end
+
+local function buildMailboxFruitQueue(targetValue)
+	targetValue = math.max(0, tonumber(targetValue) or 0)
+	if targetValue <= 0 then
+		return {}
+	end
+
+	local entries = {}
+	for key, value in pairs(getHarvestedFruitData()) do
+		local fruitValue = getFruitValueForMail(key, value)
+		if fruitValue > 0 and fruitValue <= targetValue then
+			entries[#entries + 1] = {
+				Category = "HarvestedFruits",
+				ItemKey = key,
+				Count = 1,
+				Value = fruitValue,
+			}
+		end
+	end
+
+	table.sort(entries, function(a, b)
+		if a.Value == b.Value then
+			return tostring(a.ItemKey) < tostring(b.ItemKey)
+		end
+		return a.Value > b.Value
+	end)
+
+	local queue = {}
+	local total = 0
+	for _, item in ipairs(entries) do
+		if total + item.Value <= targetValue then
+			total += item.Value
+			queue[#queue + 1] = item
+		end
+	end
+
+	return queue, total
+end
+
+local function buildMailboxBatches(items)
+	local batches, current = {}, {}
+	for _, item in ipairs(items) do
+		current[#current + 1] = {
+			Category = item.Category,
+			ItemKey = item.ItemKey,
+			Count = item.Count or 1,
+		}
+		if #current >= 20 then
+			batches[#batches + 1] = current
+			current = {}
+		end
+	end
+	if #current > 0 then
+		batches[#batches + 1] = current
+	end
+	return batches
+end
+
+local function sendMailboxOnce()
+	local networking = getNetworking()
+	local mailbox = networking and networking.Mailbox
+	if not mailbox or not mailbox.LookupPlayer or not mailbox.SendBatch then
+		state.autoMailbox = false
+		return false
+	end
+
+	local username = tostring(state.mailTargetUsername or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	if username == "" then
+		state.autoMailbox = false
+		return false
+	end
+
+	local userId = mailbox.LookupPlayer:Fire(username)
+	if not userId then
+		warn("WisHUB Carrot Mailbox: target username not found", username)
+		state.autoMailbox = false
+		return false
+	end
+
+	local queue = buildMailboxFruitQueue(state.mailTargetValue)
+	if #queue == 0 then
+		warn("WisHUB Carrot Mailbox: no harvested fruits found under target value", state.mailTargetValue)
+		return false
+	end
+
+	for _, batch in ipairs(buildMailboxBatches(queue)) do
+		if not state.autoMailbox then
+			return false
+		end
+		mailbox.SendBatch:Fire(userId, batch, tostring(state.mailNote or ""))
+		task.wait(0.01)
+	end
+
+	return true
+end
+
+local function startMailbox()
+	task.spawn(function()
+		while state.autoMailbox do
+			sendMailboxOnce()
+			state.autoMailbox = false
+			task.wait(0.01)
+		end
+	end)
+end
+
+-- Auto Claim Mail Functions
+local mailNetworkingCache
+local function getMailNetworking()
+	if mailNetworkingCache ~= nil then
+		return mailNetworkingCache or nil
+	end
+
+	local ok, result = pcall(function()
+		return require(ReplicatedStorage.SharedModules.Networking)
+	end)
+	mailNetworkingCache = ok and result or false
+	return mailNetworkingCache or nil
+end
+
+local function claimAllMailOnce()
+	local networking = getMailNetworking()
+	local mailbox = networking and networking.Mailbox
+	if not mailbox or not mailbox.OpenInbox or not mailbox.Claim then
+		return 0
+	end
+
+	local inbox = mailbox.OpenInbox:Fire()
+	if type(inbox) ~= "table" then
+		return 0
+	end
+
+	local claimed = 0
+	for mailId in pairs(inbox) do
+		if not state.autoClaimMail then
+			break
+		end
+		mailbox.Claim:Fire(mailId)
+		claimed += 1
+		task.wait(0.1)
+	end
+
+	return claimed
+end
+
+local function startClaimMail()
+	task.spawn(function()
+		while state.autoClaimMail do
+			claimAllMailOnce()
+			task.wait(1)
+		end
+	end)
+end
+
+-- Auto Collect Seed Functions
+local function getPromptCFrame(prompt)
+	if not prompt or not prompt.Parent then
+		return nil
+	end
+	local maxDist = prompt.MaxActivationDistance
+	if maxDist <= 0 then
+		maxDist = 10
+	end
+	local part = prompt:FindFirstAncestorWhichIsA("BasePart")
+	if not part then
+		return nil
+	end
+	local worldCFrame = part.CFrame * prompt.CFrame
+	local offset = worldCFrame.LookVector * maxDist
+	return worldCFrame + offset
+end
+
+local function teleportToPosition(pos)
+	local char = getCharacter()
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root or not pos then
+		return false
+	end
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	root.CFrame = CFrame.new(pos)
+	task.wait(0.05)
+	return true
+end
+
+local function firePrompt(prompt, holdDuration, keyCode, skipHold)
+	if not prompt or not prompt.Parent then
+		return false
+	end
+	local signal = prompt:FindFirstChildOfClass("RemoteEvent")
+		or prompt:FindFirstChildOfClass("RemoteFunction")
+		or prompt:FindFirstChildOfClass("BindableEvent")
+	if not signal then
+		return false
+	end
+	if signal:IsA("RemoteEvent") or signal:IsA("BindableEvent") then
+		signal:Fire()
+	elseif signal:IsA("RemoteFunction") then
+		pcall(signal.InvokeServer, signal)
+	end
+	return true
+end
+
+local function collectDroppedSeedsOnce()
+	local char = getCharacter()
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return 0
+	end
+
+	local oldPos = root.Position
+	local collected = 0
+
+	-- Find all seed prompts in workspace
+	local targets = {}
+	local seen = {}
+
+	for _, folder in ipairs({ workspace.DroppedSeeds, workspace.Seeds, workspace.Drops }) do
+		if folder then
+			for _, obj in ipairs(folder:GetDescendants()) do
+				local prompt = obj:IsA("ProximityPrompt") and obj or obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+				if prompt and prompt:IsA("ProximityPrompt") and not seen[prompt] then
+					seen[prompt] = true
+					table.insert(targets, { Prompt = prompt, Part = prompt:FindFirstAncestorWhichIsA("BasePart") })
+				elseif obj:IsA("BasePart") and not seen[obj] then
+					local text = obj.Name:lower()
+					if text:find("seed") or text:find("pack") or text:find("drop") then
+						seen[obj] = true
+						table.insert(targets, { Part = obj })
+					end
+				end
+			end
+		end
+	end
+
+	-- Sort by distance
+	table.sort(targets, function(a, b)
+		local posA = a.Prompt and getPromptCFrame(a.Prompt) or (a.Part and a.Part.Position)
+		local posB = b.Prompt and getPromptCFrame(b.Prompt) or (b.Part and b.Part.Position)
+		if not posA or not posB then
+			return false
+		end
+		local distA = (posA - root.Position).Magnitude
+		local distB = (posB - root.Position).Magnitude
+		return distA < distB
+	end)
+
+	for _, target in ipairs(targets) do
+		if not state.autoCollectSeed then
+			break
+		end
+
+		local prompt = target.Prompt
+		local part = target.Part
+
+		if prompt and prompt.Parent then
+			local targetCFrame = getPromptCFrame(prompt)
+			if targetCFrame then
+				teleportToPosition(targetCFrame.Position)
+				task.wait(0.15)
+				firePrompt(prompt, 0, 2, true)
+				collected += 1
+			end
+		elseif part and part.Parent then
+			teleportToPosition(part.Position + Vector3.new(0, 3, 0))
+			task.wait(0.15)
+			collected += 1
+		end
+
+		task.wait(0.2)
+	end
+
+	-- Return to old position
+	teleportToPosition(oldPos + Vector3.new(0, 3, 0))
+	return collected
+end
+
+local function startCollectSeed()
+	task.spawn(function()
+		while state.autoCollectSeed do
+			collectDroppedSeedsOnce()
+			task.wait(1)
+		end
+	end)
+end
+
 local rollbackActive = false
 
 local function fireRollbackOnce()
-	local packetRemote = ReplicatedStorage.SharedModules.Packet.RemoteEvent
+	local packetRemote = remote
 	if not packetRemote then
 		return false
 	end
@@ -1749,11 +2671,11 @@ local function fireRollbackOnce()
 	return true
 end
 
-local function disableRollbackOnce(force)
-	if not force and not rollbackActive then
+local function disableRollbackOnce()
+	if not rollbackActive then
 		return false
 	end
-	local packetRemote = ReplicatedStorage.SharedModules.Packet.RemoteEvent
+	local packetRemote = remote
 	if not packetRemote then
 		return false
 	end
@@ -1844,6 +2766,7 @@ local function gardenHasWantedCarrot()
 	end
 
 	local targetKg = tonumber(state.harvestKg) or 0
+	local checked = 0
 	for _, plant in ipairs(plants:GetChildren()) do
 		local matches, kg = carrotMatchesWantedKg(plant, targetKg)
 		if matches then
@@ -1859,6 +2782,17 @@ local function gardenHasWantedCarrot()
 				end
 			end
 		end
+
+		for _, obj in ipairs(plant:GetDescendants()) do
+			local objMatches, objKg = carrotMatchesWantedKg(obj, targetKg)
+			if objMatches then
+				return true, objKg
+			end
+			checked += 1
+			if checked % 150 == 0 then
+				task.wait()
+			end
+		end
 	end
 
 	return false
@@ -1866,18 +2800,6 @@ end
 
 local function rejoinGame()
 	TeleportService:Teleport(game.PlaceId, player)
-end
-
-local function queueRollbackOffNextRun()
-	local queue = queue_on_teleport
-		or (syn and syn.queue_on_teleport)
-		or (fluxus and fluxus.queue_on_teleport)
-		or (KRNL_LOADED and queue_on_teleport)
-	if type(queue) == "function" then
-		pcall(function()
-			queue("getgenv().WisHUBCarrotDisableRollbackNextRun = true")
-		end)
-	end
 end
 
 local function playerGuiHasControllerLoading()
@@ -1918,45 +2840,63 @@ local function hasLoadingStuckSignal()
 	return false
 end
 
-local loadingStuckRelogStarted = false
-local function startLoadingStuckRelogWatchdog()
-	if not cfgBool("RelogIfLoadingStuck", false) then
+local inventoryRejoinHoldLastLog = 0
+local function isInventoryReadyForAutoRejoin()
+	if not cfgBool("WaitForInventoryBeforeRejoin", true) then
+		return true
+	end
+	if not player:FindFirstChild("Backpack") then
+		return false
+	end
+	if hasLoadingStuckSignal() then
+		return false
+	end
+	return true
+end
+
+local function logInventoryRejoinHold()
+	local now = os.clock()
+	if now - inventoryRejoinHoldLastLog < 10 then
 		return
 	end
+	inventoryRejoinHoldLastLog = now
+	bootLog("tahan auto rejoin: controller/inventory belum ready")
+end
 
-	safeSpawn("loading-stuck-relog", function()
-		task.wait(cfgNumber("LoadingStuckDelay", 35, 5))
-		if not isCurrentRun() or loadingStuckRelogStarted then
-			return
+local function seedInventoryStillEmptyAfterConfirm(seedName)
+	local confirmDelay = cfgNumber("InventoryEmptyConfirmDelay", 12, 0)
+	if confirmDelay > 0 then
+		task.wait(confirmDelay)
+		if not cfgBool("AutoRejoin", true) then
+			return false
 		end
-		if not hasLoadingStuckSignal() then
-			return
+		if not isInventoryReadyForAutoRejoin() then
+			logInventoryRejoinHold()
+			return false
 		end
-
-		loadingStuckRelogStarted = true
-		if type(Config) == "table" then
-			Config.Rollback = false
-		end
-		Env.WisHUBCarrotDisableRollbackNextRun = true
-		queueRollbackOffNextRun()
-		disableRollbackOnce(true)
-		task.wait(cfgNumber("LoadingStuckRelogDelay", 2, 0))
-		if isCurrentRun() then
-			rejoinGame()
-		end
-	end)
+	end
+	return isSeedInventoryEmpty(seedName)
 end
 
 local function startRollbackRejoinMonitor()
-	if not cfgBool("AutoRejoin", false) then
+	if not cfgBool("AutoRejoin", true) then
 		return
 	end
 
-	safeSpawn("rejoin", function()
+	task.spawn(function()
 		task.wait(cfgNumber("RejoinDelay", 8, 0))
-		while isCurrentRun() and cfgBool("AutoRejoin", false) do
+		while cfgBool("AutoRejoin", true) do
 			local seedName = getRejoinSeedName()
+			if not isInventoryReadyForAutoRejoin() then
+				logInventoryRejoinHold()
+				task.wait(cfgNumber("RejoinCheckInterval", 3, 1))
+				continue
+			end
 			if isSeedInventoryEmpty(seedName) then
+				if not seedInventoryStillEmptyAfterConfirm(seedName) then
+					task.wait(cfgNumber("RejoinCheckInterval", 3, 1))
+					continue
+				end
 				local hasWantedCarrot, matchedKg = gardenHasWantedCarrot()
 				if hasWantedCarrot then
 					disableRollbackOnce()
@@ -1982,39 +2922,27 @@ local function applyNoUiConfig()
 	state.selectedSprinklers = cfgSelectedSprinklers()
 end
 
-local function boot()
-	applyNoUiConfig()
-	startLoadingStuckRelogWatchdog()
+applyNoUiConfig()
+startAntiAfk()
 
-	if state.hideNonCarrotVisuals then
-		setHideNonCarrotVisuals(true)
-	end
-
-	if cfgBool("Rollback", false) then
-		fireRollbackOnce()
-	end
-	startRollbackRejoinMonitor()
-
-	if state.autoSellAll then
-		startSellAll()
-	end
-
-	if state.autoHarvestCarrot then
-		startHarvestCarrot()
-	end
-
-	if state.autoPlantCarrot then
-		resetPlantSetup()
-		startPlantCarrot()
-	end
+if state.hideNonCarrotVisuals then
+	setHideNonCarrotVisuals(true)
 end
 
-local ok, err = xpcall(boot, function(message)
-	if type(debug) == "table" and type(debug.traceback) == "function" then
-		return debug.traceback(message, 2)
-	end
-	return message
-end)
-if not ok then
-	warn("[WisHUB Carrot Core] " .. tostring(err))
+if cfgBool("Rollback", false) then
+	fireRollbackOnce()
+end
+startRollbackRejoinMonitor()
+
+if state.autoSellAll then
+	startSellAll()
+end
+
+if state.autoHarvestCarrot then
+	startHarvestCarrot()
+end
+
+if state.autoPlantCarrot then
+	resetPlantSetup()
+	startPlantCarrot()
 end
